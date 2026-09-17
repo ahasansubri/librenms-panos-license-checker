@@ -138,7 +138,6 @@ Create a separate JSON file and service instance for each member.
 - [Multiple firewalls and HA](docs/MULTIPLE_FIREWALLS.md)
 - [Operations](docs/OPERATIONS.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [Publishing to GitHub](docs/PUBLISHING.md)
 - [Security policy](SECURITY.md)
 
 Official background documentation:
