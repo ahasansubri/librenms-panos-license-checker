@@ -82,15 +82,50 @@ Example:
 {
   "host": "192.0.2.10",
   "api_key": "PASTE_THE_RESTRICTED_API_KEY_HERE",
-  "verify_tls": true,
-  "ca_file": "/etc/ssl/certs/organization-root-ca.pem",
+  "verify_tls": false,
+  "ca_file": "",
   "timeout": 20,
   "ignore_features": []
 }
 ```
 
-If the certificate is trusted through Ubuntu's normal trust store, set
-`ca_file` to an empty string.
+### TLS Certificate Verification
+
+The documentation example uses `"verify_tls": true` as the secure production recommendation. A custom CA file is **not always required**.
+
+#### Current deployment with certificate verification disabled
+
+If the PAN-OS management interface uses a self-signed or otherwise untrusted certificate, use:
+
+```json
+"verify_tls": false,
+"ca_file": ""
+```
+
+With this configuration, the checker does not validate the firewall’s HTTPS certificate.
+
+#### Certificate trusted by Ubuntu
+
+If the PAN-OS certificate is already trusted through Ubuntu’s system trust store, use:
+
+```json
+"verify_tls": true,
+"ca_file": ""
+```
+
+No separate CA file is required in this case.
+
+#### Certificate issued by a private CA
+
+Specify a CA file only when certificate verification is enabled and the PAN-OS certificate was issued by a private or internal CA that Ubuntu does not already trust:
+
+```json
+"verify_tls": true,
+"ca_file": "/etc/ssl/certs/organization-root-ca.pem"
+```
+
+> **Note:** When `"verify_tls": false`, the `ca_file` setting is ignored. Disabling TLS verification can be useful during initial testing, but trusted certificate validation is recommended for production deployments.
+
 
 ## 5. Validate JSON and permissions
 
