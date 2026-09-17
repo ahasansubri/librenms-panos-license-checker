@@ -49,11 +49,128 @@ File:      root:librenms 0640
 - Confirm the role permits XML API Operational Requests.
 - Confirm the PAN-OS configuration was committed.
 
-## TLS certificate failure
+## TLS Certificate Verification Failure
 
-Configure the issuing CA using `ca_file` or the Ubuntu trust store. Use
-`--insecure` only to prove that certificate validation is the cause; do not add
-it permanently to LibreNMS service parameters.
+A TLS verification error means the checker can reach the PAN-OS management interface, but Python cannot establish trust in the HTTPS certificate.
+
+Common causes include:
+
+* The firewall uses a self-signed certificate.
+* The certificate was issued by an internal CA that Ubuntu does not trust.
+* The certificate has expired.
+* The certificate hostname does not match the address used by the checker.
+* An intermediate CA certificate is missing.
+* The configured `ca_file` does not exist or is unreadable by `librenms`.
+
+### Confirm that TLS verification is the problem
+
+Run the checker once with `--insecure`:
+
+```bash
+sudo -u librenms \
+  /usr/lib/nagios/plugins/check_panos_license \
+  -H 192.0.2.10 \
+  -w 60 -c 30 \
+  --insecure
+```
+
+If the check succeeds with `--insecure` but fails without it, certificate verification is the likely cause.
+
+> **Warning:** Do not add `--insecure` permanently to the LibreNMS service parameters. It disables certificate authenticity and hostname verification for that execution.
+
+### Temporarily disable TLS verification in the device configuration
+
+For controlled testing, edit the firewall’s configuration file:
+
+```bash
+sudo nano /etc/librenms/panos-license/192.0.2.10.json
+```
+
+Set:
+
+```json
+{
+  "host": "192.0.2.10",
+  "api_key": "PASTE_THE_RESTRICTED_API_KEY_HERE",
+  "verify_tls": false,
+  "ca_file": "",
+  "timeout": 20,
+  "ignore_features": []
+}
+```
+
+Validate the JSON:
+
+```bash
+python3 -m json.tool \
+  /etc/librenms/panos-license/192.0.2.10.json >/dev/null \
+  && echo "JSON syntax valid"
+```
+
+Confirm that the `librenms` account can read it:
+
+```bash
+sudo -u librenms test -r \
+  /etc/librenms/panos-license/192.0.2.10.json \
+  && echo "Configuration readable"
+```
+
+Test the checker:
+
+```bash
+sudo -u librenms \
+  /usr/lib/nagios/plugins/check_panos_license \
+  -H 192.0.2.10 \
+  -w 60 -c 30
+```
+
+When `"verify_tls": false`, the checker does not validate the firewall certificate and the `ca_file` setting is ignored.
+
+This configuration can be used during initial testing, but trusted certificate validation is recommended for production.
+
+
+
+### Recommended final production configuration
+
+When the CA is installed in Ubuntu’s trust store:
+
+```json
+{
+  "host": "panos-fw01.example.net",
+  "api_key": "PASTE_THE_RESTRICTED_API_KEY_HERE",
+  "verify_tls": true,
+  "ca_file": "",
+  "timeout": 20,
+  "ignore_features": []
+}
+```
+
+When using a checker-specific private CA bundle:
+
+```json
+{
+  "host": "panos-fw01.example.net",
+  "api_key": "PASTE_THE_RESTRICTED_API_KEY_HERE",
+  "verify_tls": true,
+  "ca_file": "/etc/librenms/panos-license/ca/panos-management-ca.pem",
+  "timeout": 20,
+  "ignore_features": []
+}
+```
+
+When temporarily bypassing certificate verification:
+
+```json
+{
+  "host": "192.0.2.10",
+  "api_key": "PASTE_THE_RESTRICTED_API_KEY_HERE",
+  "verify_tls": false,
+  "ca_file": "",
+  "timeout": 20,
+  "ignore_features": []
+}
+```
+
 
 ## Connection refused or timeout
 
