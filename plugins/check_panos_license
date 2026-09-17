@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Nagios-compatible PAN-OS licence expiry check for LibreNMS."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+OP_COMMAND = "<request><license><info/></license></request>"
+NEVER_VALUES = {"never", "never expires", "never expire", "perpetual", "n/a"}
+
+
+@dataclass(frozen=True)
+class Licence:
+    feature: str
+    expires: date
+    expired_flag: bool
+
+    @property
+    def days_remaining(self) -> int:
+        return (self.expires - date.today()).days
+
+
+def finish(code: int, message: str) -> None:
+    labels = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+    print(f"PANOS LICENCE {labels[code]} - {message}")
+    raise SystemExit(code)
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"configuration file not found: {path}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read configuration file {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("configuration root must be a JSON object")
+    if not isinstance(data.get("api_key"), str) or not data["api_key"].strip():
+        raise RuntimeError("api_key is missing from the configuration")
+    return data
+
+
+def build_ssl_context(config: dict[str, Any], insecure: bool) -> ssl.SSLContext:
+    if insecure or config.get("verify_tls") is False:
+        return ssl._create_unverified_context()
+
+    ca_file = config.get("ca_file")
+    if ca_file:
+        return ssl.create_default_context(cafile=str(ca_file))
+    return ssl.create_default_context()
+
+
+def query_firewall(host: str, config: dict[str, Any], insecure: bool) -> str:
+    timeout = int(config.get("timeout", 20))
+    url = f"https://{host}/api/"
+    body = urllib.parse.urlencode({"type": "op", "cmd": OP_COMMAND}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-PAN-KEY": config["api_key"].strip(),
+            "User-Agent": "LibreNMS-PANOS-Licence-Check/1.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=timeout,
+            context=build_ssl_context(config, insecure),
+        ) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"firewall API returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"cannot contact firewall API: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("firewall API request timed out") from exc
+
+
+def extract_result(xml_text: str) -> ET.Element:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise RuntimeError("firewall returned invalid XML") from exc
+
+    if root.attrib.get("status") != "success":
+        message = " ".join(text.strip() for text in root.itertext() if text.strip())
+        raise RuntimeError(f"PAN-OS API error: {message or 'unknown error'}")
+
+    result = root.find("result")
+    if result is None:
+        raise RuntimeError("successful API response did not contain a result")
+    return result
+
+
+def parse_expiry(value: str) -> date | None:
+    normalized = value.strip().lower()
+    if normalized in NEVER_VALUES or "never" in normalized:
+        return None
+
+    for pattern in ("%B %d, %Y", "%b %d, %Y", "%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value.strip(), pattern).date()
+        except ValueError:
+            continue
+    raise ValueError(f"unsupported expiry date: {value}")
+
+
+def ignored(feature: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(feature.lower(), pattern.lower()) for pattern in patterns)
+
+
+def parse_licences(result_text: str, ignore_patterns: list[str]) -> tuple[list[Licence], int]:
+    licences: list[Licence] = []
+    perpetual_count = 0
+
+    for block in result_text.split("License entry:")[1:]:
+        values: dict[str, str] = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                values[key.strip().lower()] = value.strip()
+
+        feature = values.get("feature", "Unnamed licence")
+        if ignored(feature, ignore_patterns):
+            continue
+
+        expires_value = values.get("expires")
+        if not expires_value:
+            continue
+
+        expires = parse_expiry(expires_value)
+        if expires is None:
+            perpetual_count += 1
+            continue
+
+        expired_flag = values.get("expired?", "no").lower() in {"yes", "true", "1"}
+        licences.append(Licence(feature=feature, expires=expires, expired_flag=expired_flag))
+
+    return licences, perpetual_count
+
+
+def parse_api_result(result: ET.Element, ignore_patterns: list[str]) -> tuple[list[Licence], int]:
+    """Parse both structured XML API output and older CLI-style text output."""
+    licences: list[Licence] = []
+    perpetual_count = 0
+
+    for entry in result.findall(".//entry"):
+        values: dict[str, str] = {}
+        for child in list(entry):
+            tag = child.tag.rsplit("}", 1)[-1].lower()
+            values[tag] = "".join(child.itertext()).strip()
+
+        feature = values.get("feature") or entry.attrib.get("name") or "Unnamed licence"
+        if ignored(feature, ignore_patterns):
+            continue
+
+        expires_value = values.get("expires")
+        if not expires_value:
+            continue
+
+        expires = parse_expiry(expires_value)
+        if expires is None:
+            perpetual_count += 1
+            continue
+
+        expired_flag = values.get("expired", values.get("expired?", "no")).lower() in {
+            "yes",
+            "true",
+            "1",
+        }
+        licences.append(Licence(feature=feature, expires=expires, expired_flag=expired_flag))
+
+    if licences or perpetual_count:
+        return licences, perpetual_count
+
+    return parse_licences("\n".join(result.itertext()), ignore_patterns)
+
+
+def item_text(licence: Licence) -> str:
+    days = licence.days_remaining
+    expiry = licence.expires.strftime("%d %b %Y")
+    if licence.expired_flag or days < 0:
+        return f"{licence.feature}: expired {abs(days)} day(s) ago ({expiry})"
+    if days == 0:
+        return f"{licence.feature}: expires today ({expiry})"
+    return f"{licence.feature}: {days} day(s) remaining ({expiry})"
+
+
+def evaluate(licences: list[Licence], warning_days: int, critical_days: int) -> tuple[int, str]:
+    critical = [licence for licence in licences if licence.expired_flag or licence.days_remaining <= critical_days]
+    warning = [
+        licence
+        for licence in licences
+        if licence not in critical and licence.days_remaining <= warning_days
+    ]
+
+    if critical:
+        details = "; ".join(item_text(item) for item in sorted(critical, key=lambda x: x.days_remaining))
+        if warning:
+            details += "; warning: " + "; ".join(
+                item_text(item) for item in sorted(warning, key=lambda x: x.days_remaining)
+            )
+        return CRITICAL, details
+
+    if warning:
+        return WARNING, "; ".join(item_text(item) for item in sorted(warning, key=lambda x: x.days_remaining))
+
+    nearest = min(licences, key=lambda item: item.days_remaining)
+    return OK, f"{len(licences)} expiring licence(s) healthy; nearest is {item_text(nearest)}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("host", nargs="?", help="PAN-OS management IP or hostname")
+    parser.add_argument("-H", "--hostname", dest="host_option", help="PAN-OS management IP or hostname")
+    parser.add_argument("--config", help="JSON configuration file")
+    parser.add_argument("-w", "--warning", type=int, default=60, help="warning threshold in days")
+    parser.add_argument("-c", "--critical", type=int, default=30, help="critical threshold in days")
+    parser.add_argument("--insecure", action="store_true", help="disable TLS certificate validation")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    host = args.host_option or args.host
+    if not host:
+        finish(UNKNOWN, "firewall host was not provided")
+    if args.warning < 0 or args.critical < 0 or args.critical > args.warning:
+        finish(UNKNOWN, "thresholds must satisfy 0 <= critical <= warning")
+
+    config_path = Path(args.config or f"/etc/librenms/panos-license/{host}.json")
+
+    try:
+        config = load_config(config_path)
+        api_host = str(config.get("host") or host)
+        result = extract_result(query_firewall(api_host, config, args.insecure))
+        ignore_patterns = config.get("ignore_features", [])
+        if not isinstance(ignore_patterns, list) or not all(isinstance(item, str) for item in ignore_patterns):
+            raise RuntimeError("ignore_features must be a JSON array of strings")
+        licences, perpetual_count = parse_api_result(result, ignore_patterns)
+        if not licences:
+            if perpetual_count:
+                finish(OK, f"no expiring licences; {perpetual_count} perpetual licence(s) ignored")
+            finish(UNKNOWN, "no parseable licence entries were returned")
+        status, message = evaluate(licences, args.warning, args.critical)
+        if perpetual_count:
+            message += f"; {perpetual_count} perpetual licence(s) ignored"
+        finish(status, message)
+    except (RuntimeError, ValueError, OSError) as exc:
+        finish(UNKNOWN, str(exc))
+
+
+if __name__ == "__main__":
+    main()

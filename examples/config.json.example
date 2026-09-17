@@ -1,0 +1,9 @@
+{
+  "host": "192.0.2.10",
+  "api_key": "REPLACE_WITH_A_RESTRICTED_PANOS_API_KEY",
+  "verify_tls": true,
+  "ca_file": "/etc/ssl/certs/organization-root-ca.pem",
+  "timeout": 20,
+  "ignore_features": []
+}
+
